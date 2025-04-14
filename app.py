@@ -3,10 +3,13 @@ from twilio.twiml.messaging_response import MessagingResponse
 import openai
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime
+from openai import OpenAI
 
+# === Init ===
 app = Flask(__name__)
 openai.api_key = os.environ['OPENAI_API_KEY']
+client = OpenAI(api_key=openai.api_key)
 
 # === Persistent Storage ===
 conn = sqlite3.connect('message_tracker.db', check_same_thread=False)
@@ -32,77 +35,79 @@ CREATE TABLE IF NOT EXISTS message_log (
 ''')
 conn.commit()
 
-def log_tokens(user_id, date, input_tokens, output_tokens):
-    cursor.execute('SELECT input_tokens, output_tokens FROM token_log WHERE user_id = ? AND date = ?', (user_id, date))
-    result = cursor.fetchone()
-    if result:
-        new_input = result[0] + input_tokens
-        new_output = result[1] + output_tokens
-        cursor.execute('UPDATE token_log SET input_tokens = ?, output_tokens = ? WHERE user_id = ? AND date = ?', 
-                       (new_input, new_output, user_id, date))
-    else:
-        cursor.execute('INSERT INTO token_log (user_id, date, input_tokens, output_tokens) VALUES (?, ?, ?, ?)', 
-                       (user_id, date, input_tokens, output_tokens))
-    conn.commit()
+# === Guardrails System Prompt ===
+system_prompt = """
+You are an AI performance coach focused on running, gym, and nutrition. 
+Only reply to topics directly related to:
+- Running training plans
+- Recovery strategies
+- Running gear
+- Running form and pace
+- Strength training and gym advice
+- Nutrition and fueling for athletes
+- Hydration and sleep
 
-def log_message(user_id, date, role, message):
-    cursor.execute('INSERT INTO message_log (user_id, date, role, message) VALUES (?, ?, ?, ?)',
-                   (user_id, date, role, message))
-    conn.commit()
+If someone asks anything outside that scope (like philosophy, relationships, etc), respond with:
+"I'm here to help with running, gym, and nutrition only! 🏃‍♂️🏋️🥦"
 
-# === WhatsApp Webhook ===
-@app.route("/whatsapp", methods=["POST"])
-def whatsapp():
-    incoming_msg = request.values.get("Body", "")
-    user_id = request.values.get("From", "")
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    system_prompt = """
-You are a performance coach specialized in running, gym training, and nutrition.
-Your job is to help users improve their:
-- Running performance
-- Strength and gym routines
-- Recovery
-- Nutrition habits
-
-ONLY respond to topics related to:
-- Running (training plans, form, pace, recovery, gear)
-- Gym or strength training (workouts, routines, mobility, rest)
-- Recovery strategies (massage, sleep, hydration, active rest)
-- Fueling (before/during/after exercise)
-- Food and nutrition choices for athletic performance
-
-If someone asks something outside this scope (like philosophy, relationships, politics), say:
-"I'm here to help with training and nutrition only! 🏋️‍♂️🥦"
-
-Be energetic, supportive, and specific in your advice.
-Encourage feedback and try to identify each user’s preferred communication style: Are they chatty? Brief? Data-driven? Motivational?
-
-Your ultimate goal is for users to associate their physical progress with your support 💪
+Keep your tone supportive and motivating.
+Track what kind of tone or frequency works best for the user and ask them for feedback occasionally.
 """
 
-    chat_response = openai.chat.completions.create(
+# === Route ===
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp():
+    incoming_msg = request.values.get("Body", "").strip()
+    user_id = request.values.get("From", "").strip()
+
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    print(f"📩 Message from {user_id}: {incoming_msg}")
+
+    # --- Save to message_log ---
+    cursor.execute('INSERT INTO message_log (user_id, date, role, message) VALUES (?, ?, ?, ?)',
+                   (user_id, now, "user", incoming_msg))
+    conn.commit()
+
+    # --- Retrieve full history ---
+    cursor.execute('SELECT role, message FROM message_log WHERE user_id = ? ORDER BY date ASC', (user_id,))
+    rows = cursor.fetchall()
+    message_history = [{"role": role, "content": msg} for role, msg in rows]
+    message_history.insert(0, {"role": "system", "content": system_prompt})
+
+    # --- Chat Completion ---
+    response = client.chat.completions.create(
         model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": incoming_msg}
-        ]
+        messages=message_history
     )
 
-    reply = chat_response.choices[0].message.content
-    print("🤖 REPLY:", reply)  # <=== DEBUG LOG
+    reply = response.choices[0].message.content
 
-    # === Log tokens and messages ===
-    usage = chat_response.usage
-    input_tokens = usage.prompt_tokens
-    output_tokens = usage.completion_tokens
+    # --- Truncate to avoid Twilio 1600 char limit ---
+    if len(reply) > 1500:
+        reply = reply[:1495] + "..."
 
-    log_tokens(user_id, today, input_tokens, output_tokens)
-    log_message(user_id, today, "user", incoming_msg)
-    log_message(user_id, today, "assistant", reply)
+    print(f"🤖 REPLY: {reply}")
 
-    # Twilio response
-    resp = MessagingResponse()
-    msg = resp.message()
+    # --- Save response to message_log ---
+    cursor.execute('INSERT INTO message_log (user_id, date, role, message) VALUES (?, ?, ?, ?)',
+                   (user_id, now, "assistant", reply))
+    conn.commit()
+
+    # --- Track tokens ---
+    usage = response.usage
+    cursor.execute('''
+        INSERT INTO token_log (user_id, date, input_tokens, output_tokens)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id, date) DO UPDATE SET 
+        input_tokens = input_tokens + excluded.input_tokens,
+        output_tokens = output_tokens + excluded.output_tokens
+    ''', (user_id, today, usage.prompt_tokens, usage.completion_tokens))
+    conn.commit()
+
+    # --- Respond via Twilio ---
+    twilio_resp = MessagingResponse()
+    msg = twilio_resp.message()
     msg.body(reply)
-    return str(resp)
+    return str(twilio_resp)
