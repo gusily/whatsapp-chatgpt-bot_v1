@@ -50,46 +50,6 @@ def log_message(user_id, date, role, message):
                    (user_id, date, role, message))
     conn.commit()
 
-# === Summary Generator ===
-def generate_summary(user_id):
-    summary_prompt = (
-        "You are a performance coach specializing in running and nutrition. "
-        "The user has interacted with you over the past week via WhatsApp. "
-        "Your job is to create a clear, concise weekly summary based on your conversation.\n\n"
-        "Summarize:\n"
-        "- Key topics the user focused on (e.g., long runs, injury prevention, fueling)\n"
-        "- Advice you gave them\n"
-        "- Any changes or improvements in mindset or routine and the reason why you're suggesting that\n"
-        "- Suggestions or goals for the upcoming week\n\n"
-        "Keep the tone encouraging, specific, and tailored to the user’s journey.\n\n"
-        "Also, you've tried to identify how to talk with your user, tell them what you've identified in terms of communication and ask if you're right and in what can you improve."
-    )
-
-    today = datetime.now()
-    week_ago = today - timedelta(days=7)
-    week_dates = [(week_ago + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
-
-    cursor.execute('SELECT date, role, message FROM message_log WHERE user_id = ? AND date IN ({})'.format(
-        ','.join('?' for _ in week_dates)), (user_id, *week_dates))
-    logs = cursor.fetchall()
-
-    messages = []
-    for _, role, message in logs:
-        messages.append({"role": role, "content": message})
-
-    if not messages:
-        return "No messages found for this user in the past 7 days."
-
-    response = openai.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=[
-            {"role": "system", "content": summary_prompt},
-            *messages
-        ]
-    )
-
-    return response.choices[0].message.content
-
 # === WhatsApp Webhook ===
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp():
@@ -97,8 +57,8 @@ def whatsapp():
     user_id = request.values.get("From", "")
     today = datetime.now().strftime("%Y-%m-%d")
 
-   system_prompt = """
-You are a performance coach specialized in **running, gym training, and nutrition**.
+    system_prompt = """
+You are a performance coach specialized in running, gym training, and nutrition.
 Your job is to help users improve their:
 - Running performance
 - Strength and gym routines
@@ -113,7 +73,7 @@ ONLY respond to topics related to:
 - Food and nutrition choices for athletic performance
 
 If someone asks something outside this scope (like philosophy, relationships, politics), say:
-**“I'm here to help with training and nutrition only! 🏋️‍♂️🥦”**
+"I'm here to help with training and nutrition only! 🏋️‍♂️🥦"
 
 Be energetic, supportive, and specific in your advice.
 Encourage feedback and try to identify each user’s preferred communication style: Are they chatty? Brief? Data-driven? Motivational?
@@ -121,20 +81,18 @@ Encourage feedback and try to identify each user’s preferred communication sty
 Your ultimate goal is for users to associate their physical progress with your support 💪
 """
 
-        )
-    }
-
+    # OpenAI chat completion
     chat_response = openai.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
-            system_message,
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": incoming_msg}
         ]
     )
 
     reply = chat_response.choices[0].message.content
 
-    # Log tokens and messages
+    # === Log tokens and messages ===
     usage = chat_response.usage
     input_tokens = usage.prompt_tokens
     output_tokens = usage.completion_tokens
@@ -143,6 +101,7 @@ Your ultimate goal is for users to associate their physical progress with your s
     log_message(user_id, today, "user", incoming_msg)
     log_message(user_id, today, "assistant", reply)
 
+    # Twilio response
     resp = MessagingResponse()
     msg = resp.message()
     msg.body(reply)
