@@ -81,7 +81,6 @@ Encourage feedback and try to identify each user’s preferred communication sty
 Your ultimate goal is for users to associate their physical progress with your support 💪
 """
 
-    # OpenAI chat completion
     chat_response = openai.chat.completions.create(
         model="gpt-4-turbo",
         messages=[
@@ -91,6 +90,7 @@ Your ultimate goal is for users to associate their physical progress with your s
     )
 
     reply = chat_response.choices[0].message.content
+    print("🤖 REPLY:", reply)  # <=== DEBUG LOG
 
     # === Log tokens and messages ===
     usage = chat_response.usage
